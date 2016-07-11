@@ -25,10 +25,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+
+#include <flatpak.h>
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
@@ -381,6 +382,104 @@ handle_open_in_thread_func (GTask *task,
                                                 g_object_ref (request));
 }
 
+static char *
+uri_from_app_symlink (const char *app_symlink,
+                      Request *request)
+{
+  char *path;
+  const char *deploy_dir;
+  g_autofree char *real_path = NULL;
+  g_autoptr(FlatpakInstalledRef) app_ref = NULL;
+  g_autoptr(FlatpakInstallation) user_install = NULL;
+
+  path = strstr (app_symlink, "/app");
+  if (!path)
+    return NULL;
+
+  path += strlen ("/app");
+
+  user_install = flatpak_installation_new_user (NULL, NULL);
+
+  if (user_install)
+    {
+      app_ref =
+        flatpak_installation_get_current_installed_app (user_install,
+                                                        request->app_id,
+                                                        NULL, NULL);
+    }
+
+  if (!app_ref)
+    {
+      g_autoptr(FlatpakInstallation) system_install =
+        flatpak_installation_new_system (NULL, NULL);
+
+      if (system_install)
+        {
+          app_ref =
+            flatpak_installation_get_current_installed_app (system_install,
+                                                            request->app_id,
+                                                            NULL, NULL);
+        }
+    }
+
+  if (!app_ref)
+    return NULL;
+
+  deploy_dir = flatpak_installed_ref_get_deploy_dir (app_ref);
+  real_path = g_build_filename (deploy_dir, "files", path, NULL);
+
+  return g_filename_to_uri (real_path, NULL, NULL);
+}
+
+static gboolean
+handle_open_fd (XdpOpenURI *object,
+                GDBusMethodInvocation *invocation,
+                GUnixFDList *fd_list,
+                const gchar *arg_parent_window,
+                GVariant *arg_fd,
+                GVariant *arg_options)
+
+{
+  int idx, fd;
+  g_autofree char *proc_path = NULL;
+  g_autofree char *uri = NULL;
+  ssize_t symlink_size;
+  char path_buffer[PATH_MAX + 1];
+  Request *request;
+  g_autoptr(GFile) file = NULL;
+  g_autoptr(GTask) task = NULL;
+
+  g_variant_get (arg_fd, "h", &idx);
+  fd = g_unix_fd_list_get (fd_list, idx, NULL);
+  proc_path = g_strdup_printf ("/proc/self/fd/%d", fd);
+
+  if ((symlink_size = readlink (proc_path, path_buffer, PATH_MAX)) < 0)
+    {
+      g_dbus_method_invocation_return_error (invocation,
+                                             G_DBUS_ERROR,
+                                             G_DBUS_ERROR_ACCESS_DENIED,
+                                             "Cannot access file descriptor");
+      return TRUE;
+    }
+
+  path_buffer[symlink_size] = 0;
+
+  request = request_from_invocation (invocation);
+  /* XXX: is there any other way to do this using the FD directly? */
+  uri = uri_from_app_symlink (path_buffer, request);
+
+  g_object_set_data_full (G_OBJECT (request), "uri", g_strdup (uri), g_free);
+  g_object_set_data_full (G_OBJECT (request), "parent-window", g_strdup (arg_parent_window), g_free);
+
+  request_export (request, g_dbus_method_invocation_get_connection (invocation));
+
+  task = g_task_new (object, NULL, NULL, NULL);
+  g_task_set_task_data (task, g_object_ref (request), g_object_unref);
+  g_task_run_in_thread (task, handle_open_in_thread_func);
+
+  return TRUE;
+}
+
 static gboolean
 handle_open_uri (XdpOpenURI *object,
                  GDBusMethodInvocation *invocation,
@@ -408,6 +507,7 @@ static void
 open_uri_iface_init (XdpOpenURIIface *iface)
 {
   iface->handle_open_uri = handle_open_uri;
+  iface->handle_open_fd = handle_open_fd;
 }
 
 static void
