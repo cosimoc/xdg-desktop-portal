@@ -256,6 +256,50 @@ app_chooser_done (GObject *source,
 }
 
 static void
+handle_open_fd_in_thread_func (GTask *task,
+                               gpointer source_object,
+                               gpointer task_data,
+                               GCancellable *cancellable)
+{
+  Request *request = (Request *)task_data;
+  g_autofree char *proc_path;
+  g_autofree char *proc_uri;
+  g_autofree char *basename;
+  g_autofree char *content_type = NULL;
+  const char *parent_window;
+  const char *path;
+  int fd;
+  guchar sniff_buffer[4096];
+  gsize sniff_length = 4096;
+  gboolean res;
+  g_autoptr(GAppInfo) info = NULL;
+  GList uris;
+
+  fd = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (request), "fd"));
+  path = (const char *)g_object_get_data (G_OBJECT (request), "path");
+  parent_window = (const char *)g_object_get_data (G_OBJECT (request), "parent-window");
+
+  REQUEST_AUTOLOCK (request);
+
+  proc_path = g_strdup_printf ("/proc/self/fd/%d", fd);
+  proc_uri = g_filename_to_uri (proc_path, NULL, NULL);
+  uris.data = proc_uri;
+  uris.prev = uris.next = NULL;
+
+  basename = g_path_get_basename (path);
+
+  res = read (fd, sniff_buffer, sniff_length);
+  if (res < 0)
+    {
+      g_warning ("cannot read from fd");
+      return;
+    }
+
+  content_type = g_content_type_guess (basename, sniff_buffer, res, NULL);
+                                            
+}
+
+static void
 handle_open_in_thread_func (GTask *task,
                             gpointer source_object,
                             gpointer task_data,
@@ -468,14 +512,15 @@ handle_open_fd (XdpOpenURI *object,
   /* XXX: is there any other way to do this using the FD directly? */
   uri = uri_from_app_symlink (path_buffer, request);
 
-  g_object_set_data_full (G_OBJECT (request), "uri", g_strdup (uri), g_free);
+  g_object_set_data (G_OBJECT (request), "fd", G_INT_TO_POINTER (fd));
+  g_object_set_data_full (G_OBJECT (request), "path", g_strdup (path_buffer), g_free);
   g_object_set_data_full (G_OBJECT (request), "parent-window", g_strdup (arg_parent_window), g_free);
 
   request_export (request, g_dbus_method_invocation_get_connection (invocation));
 
   task = g_task_new (object, NULL, NULL, NULL);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
-  g_task_run_in_thread (task, handle_open_in_thread_func);
+  g_task_run_in_thread (task, handle_open_fd_in_thread_func);
 
   return TRUE;
 }
